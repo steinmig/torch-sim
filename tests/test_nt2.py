@@ -335,7 +335,6 @@ _SN2_SETTINGS_BOHR = NT2Settings(
     attractive_bond_order_stop=0.75,
     repulsive_bond_order_stop=0.15,
     use_micro_cycles=True,
-    fixed_number_of_micro_cycles=True,
     number_of_micro_cycles=10,
     filter_passes=10,
     extraction_criterion="lastBeforeTarget",

@@ -35,7 +35,6 @@ class NT2Settings:
     attractive_bond_order_stop: float = 0.75
     repulsive_bond_order_stop: float = 0.15
     use_micro_cycles: bool = True
-    fixed_number_of_micro_cycles: bool = True
     number_of_micro_cycles: int = 10
     filter_passes: int = 10
     extraction_criterion: str = "lastBeforeTarget"
@@ -505,7 +504,6 @@ def _batched_bfgs_micro_cycles(
     positions: torch.Tensor,
     state: SimState,
     trackers: list[_SystemTracker],
-    system_idx: torch.Tensor,
 ) -> None:
     """Run BFGS+GDIIS micro-cycle relaxation with batched model calls.
 
@@ -544,24 +542,29 @@ def _batched_bfgs_micro_cycles(
             "old_value": 0.0,
         }
 
-    # ---- batched evaluation helper ----
-    def _eval_all() -> dict[int, tuple[float, torch.Tensor]]:
-        pos_l, mass_l, z_l, cell_l, sidx_l = [], [], [], [], []
-        for idx, (s, tr) in enumerate(active):
-            off, n_at = tr.atom_offset, tr.n_atoms
-            pos_l.append(positions[off: off + n_at].clone())
-            mass_l.append(state.masses[off: off + n_at].clone())
-            z_l.append(tr.atomic_numbers.clone())
-            cell_l.append(state.cell[s: s + 1].clone())
-            sidx_l.append(torch.full((n_at,), idx, device=dev, dtype=torch.long))
+    # ---- pre-compute static parts of the batched micro state ----
+    mass_l, z_l, cell_l, sidx_l = [], [], [], []
+    for idx, (s, tr) in enumerate(active):
+        off, n_at = tr.atom_offset, tr.n_atoms
+        mass_l.append(state.masses[off: off + n_at])
+        z_l.append(tr.atomic_numbers)
+        cell_l.append(state.cell[s: s + 1])
+        sidx_l.append(torch.full((n_at,), idx, device=dev, dtype=torch.long))
+    static_masses = torch.cat(mass_l)
+    static_z = torch.cat(z_l)
+    static_cell = torch.cat(cell_l)
+    static_sidx = torch.cat(sidx_l)
 
+    def _eval_all() -> dict[int, tuple[float, torch.Tensor]]:
+        pos_l = [positions[tr.atom_offset: tr.atom_offset + tr.n_atoms].clone()
+                 for _, tr in active]
         batch = SimState(
             positions=torch.cat(pos_l),
-            masses=torch.cat(mass_l),
-            cell=torch.cat(cell_l),
+            masses=static_masses,
+            cell=static_cell,
             pbc=state.pbc,
-            atomic_numbers=torch.cat(z_l),
-            system_idx=torch.cat(sidx_l),
+            atomic_numbers=static_z,
+            system_idx=static_sidx,
         )
         out = model(batch)
 
@@ -849,18 +852,16 @@ def batch_nt2_optimize(
         #    All active systems are evaluated together in a single batched
         #    model call per micro-iteration.
         if cycle > 1:
-            _batched_bfgs_micro_cycles(
-                model, positions, state, trackers, system_idx,
-            )
+            _batched_bfgs_micro_cycles(model, positions, state, trackers)
 
         # 2) Build batched state and call model ONCE
         current_state = SimState(
             positions=positions.clone(),
-            masses=state.masses.clone(),
-            cell=state.cell.clone(),
+            masses=state.masses,
+            cell=state.cell,
             pbc=state.pbc,
-            atomic_numbers=state.atomic_numbers.clone(),
-            system_idx=system_idx.clone(),
+            atomic_numbers=state.atomic_numbers,
+            system_idx=system_idx,
         )
         output = model(current_state)
         all_forces = output["forces"].detach()   # [n_total_atoms, 3]
