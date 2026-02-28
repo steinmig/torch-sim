@@ -12,6 +12,7 @@ convergence tracking run in a lightweight Python loop.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -40,6 +41,9 @@ class NT2Settings:
     extraction_criterion: str = "lastBeforeTarget"
     extra_macrocycles_after_bond_criteria: int = 10
     fixed_atoms: list[int] = field(default_factory=list)
+    cov_radii: dict[int, float] | None = None
+    bond_det_cov_radii: dict[int, float] | None = None
+    bond_tolerance: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -57,8 +61,12 @@ def _get_cov_radii() -> dict[int, float]:
     return _COVALENT_RADII_ANGSTROM
 
 
-def _smallest_cov_radius(atomic_numbers: torch.Tensor, indices: list[int]) -> float:
-    table = _get_cov_radii()
+def _smallest_cov_radius(
+    atomic_numbers: torch.Tensor,
+    indices: list[int],
+    cov_radii: dict[int, float] | None = None,
+) -> float:
+    table = cov_radii if cov_radii is not None else _get_cov_radii()
     return min(table.get(int(atomic_numbers[i].item()), 1.5) for i in indices)
 
 
@@ -249,8 +257,11 @@ def _update_gradients(
     rxn_coord = torch.zeros_like(grad)
     max_scale = 0.0
 
+    custom_radii = settings.cov_radii
+
     for left, right in associations:
-        r12cov = _smallest_cov_radius(atomic_numbers, left) + _smallest_cov_radius(atomic_numbers, right)
+        r12cov = (_smallest_cov_radius(atomic_numbers, left, custom_radii)
+                  + _smallest_cov_radius(atomic_numbers, right, custom_radii))
         c2c = _center_to_center(positions, left, right)
         dist = c2c.norm().item()
 
@@ -316,8 +327,11 @@ def _converged(
     """Check if all reaction coordinates have met their criteria."""
     associations, dissociations = _infer_reactions(association_list, dissociation_list, bond_matrix)
 
+    custom_radii = settings.cov_radii
+
     for left, right in associations:
-        r12cov = _smallest_cov_radius(atomic_numbers, left) + _smallest_cov_radius(atomic_numbers, right)
+        r12cov = (_smallest_cov_radius(atomic_numbers, left, custom_radii)
+                  + _smallest_cov_radius(atomic_numbers, right, custom_radii))
         c2c = _center_to_center(positions, left, right)
         dist = c2c.norm().item()
         bo = sum(float(bond_matrix[l, r].item()) for l in left for r in right)
@@ -402,6 +416,266 @@ class _SystemTracker:
     first_coord_reached: int = -1
     extra_macrocycles_remaining: int = -1
     finished: bool = False
+
+
+# ---------------------------------------------------------------------------
+# BFGS micro-cycle optimizer  (matches SCINE Utils::Bfgs with trust radius)
+# ---------------------------------------------------------------------------
+
+def _is_oscillating(value_memory: deque) -> bool:
+    """Check if the energy history shows an oscillating pattern (alternating signs)."""
+    n = len(value_memory)
+    if n < 3:
+        return False
+    if abs(value_memory[0] - value_memory[1]) < 1e-12:
+        return False
+    prev_positive = (value_memory[0] - value_memory[1]) > 0.0
+    for i in range(2, n):
+        this_positive = (value_memory[i - 1] - value_memory[i]) > 0.0
+        if prev_positive == this_positive:
+            return False
+        prev_positive = this_positive
+    return True
+
+
+def _gdiis_update(
+    inv_h: torch.Tensor,
+    params: torch.Tensor,
+    grad: torch.Tensor,
+    x_store: torch.Tensor,
+    g_store: torch.Tensor,
+    gdiis_cycle: int,
+    max_store: int,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """GDIIS extrapolation (matches SCINE Utils::Gdiis::update).
+
+    Returns (params, grad, gdiis_cycle) – params/grad may be modified in-place.
+    If the extrapolation would raise the energy, the history is flushed.
+    """
+    if max_store < 2:
+        return params, grad, gdiis_cycle
+
+    col = gdiis_cycle % max_store
+    gdiis_cycle += 1
+    x_store[:, col] = params
+    g_store[:, col] = grad
+
+    n = min(gdiis_cycle, max_store)
+    if gdiis_cycle < 2:
+        return params, grad, gdiis_cycle
+
+    dx = torch.zeros_like(g_store[:, :n])
+    for i in range(n):
+        dx[:, i] = -(inv_h @ g_store[:, i])
+
+    B = torch.zeros(n + 1, n + 1, dtype=params.dtype, device=params.device)
+    B[:n, :n] = dx[:, :n].T @ dx[:, :n]
+    B[n, :n] = 1.0
+    B[:n, n] = 1.0
+
+    rhs = torch.zeros(n + 1, dtype=params.dtype, device=params.device)
+    rhs[n] = 1.0
+    try:
+        coeffs = torch.linalg.solve(B, rhs)
+    except torch.linalg.LinAlgError:
+        return params, grad, 0  # flush on singular B
+    c_sum = coeffs[:n].sum().item()
+    if abs(c_sum) < 1e-12:
+        return params, grad, 0  # flush
+    coeffs /= c_sum
+
+    tmp_grad = (g_store[:, :n] @ coeffs[:n])
+    tmp_param = (x_store[:, :n] @ coeffs[:n])
+
+    dx_diis = tmp_param - params
+    dx_norm = dx_diis.norm().item()
+    grad_norm = tmp_grad.norm().item()
+    if dx_norm > 1e-12 and grad_norm > 1e-12:
+        exp_change = float(tmp_grad.dot(dx_diis).item()) / (grad_norm * dx_norm)
+        if exp_change > 1e-4:
+            return params, grad, 0  # flush
+
+    params = tmp_param
+    grad = tmp_grad
+    return params, grad, gdiis_cycle
+
+
+def _bfgs_micro_cycles(
+    model: "ModelInterface",
+    positions: torch.Tensor,
+    masses: torch.Tensor,
+    cell: torch.Tensor,
+    pbc: torch.Tensor,
+    tr: _SystemTracker,
+    cycle: int,
+) -> None:
+    """Run BFGS+GDIIS micro-cycle relaxation of non-reactive atoms in-place.
+
+    Faithfully reimplements the SCINE BFGS optimizer loop used inside
+    ``NtOptimizer2`` for micro-iterations, including GDIIS extrapolation,
+    trust-radius clamping, inverse-Hessian damping (Powell / Al-Baali–
+    Grandinetti), and oscillation correction.
+    """
+    off = tr.atom_offset
+    n_at = tr.n_atoms
+    n_params = n_at * 3
+    trust_radius = 0.2
+    max_micro = tr.settings.number_of_micro_cycles
+    gdiis_max_store = 5
+
+    dev, dt = positions.device, positions.dtype
+    inv_h = 0.5 * torch.eye(n_params, dtype=dt, device=dev)
+
+    # GDIIS storage
+    x_store = torch.zeros(n_params, gdiis_max_store, dtype=dt, device=dev)
+    g_store = torch.zeros(n_params, gdiis_max_store, dtype=dt, device=dev)
+    gdiis_cycle = 0
+
+    def _eval() -> tuple[float, torch.Tensor]:
+        """Evaluate energy and projected micro gradients."""
+        micro_state = SimState(
+            positions=positions[off: off + n_at].clone(),
+            masses=masses[off: off + n_at].clone(),
+            cell=cell.clone(),
+            pbc=pbc,
+            atomic_numbers=tr.atomic_numbers.clone(),
+        )
+        out = model(micro_state)
+        val = float(out["energy"].item())
+        grad = -out["forces"].detach()  # [n_at, 3]
+        grad = _eliminate_reactive_gradients(
+            positions[off: off + n_at], grad,
+            tr.reactive_atoms, tr.constraints_map,
+        )
+        if tr.settings.fixed_atoms:
+            for a in tr.settings.fixed_atoms:
+                grad[a] = 0.0
+        return val, grad
+
+    def _reset_inv_h(dg: torch.Tensor, dx_t_dg: float) -> None:
+        nonlocal inv_h
+        dg_t_dg = float(dg.dot(dg).item())
+        if dg_t_dg > 1e-9:
+            inv_h = torch.eye(n_params, dtype=dt, device=dev) * (dx_t_dg / dg_t_dg)
+        else:
+            inv_h = 0.5 * torch.eye(n_params, dtype=dt, device=dev)
+
+    value, grad_mat = _eval()
+    grad = grad_mat.reshape(-1)
+    params = positions[off: off + n_at].clone().reshape(-1)
+    params_old = params.clone()
+    grad_old = grad.clone()
+    old_value = value
+
+    # Convergence thresholds (GradientBasedCheck defaults)
+    step_max_thresh = 1e-4
+    step_rms_thresh = 5e-4
+    grad_max_thresh = 5e-5
+    grad_rms_thresh = 1e-5
+    delta_val_thresh = 1e-7
+
+    # Initial step (SD-like with invH = 0.5*I)
+    step = -(inv_h @ grad)
+    if trust_radius > 0:
+        projected = params + step - params_old
+        max_val = projected.abs().max().item()
+        if max_val > trust_radius:
+            step = projected * (trust_radius / max_val)
+    params = params + step
+    positions[off: off + n_at] = params.reshape(n_at, 3)
+
+    value_memory: deque[float] = deque(maxlen=10)
+    bfgs_cycle = 1  # matches SCINE's _cycle after initial step
+
+    for _mc in range(max_micro):
+        bfgs_cycle += 1
+        value, grad_mat = _eval()
+        grad = grad_mat.reshape(-1)
+
+        # Convergence check (SCINE checks BEFORE BFGS update; minIter=1)
+        if bfgs_cycle > 2:  # minIter=1 → check from cycle 3 onward
+            param_step = params - params_old
+            step_max = float(param_step.abs().max().item())
+            step_rms = float((param_step ** 2).mean().sqrt().item())
+            grad_max = float(grad.abs().max().item())
+            grad_rms = float((grad ** 2).mean().sqrt().item())
+            d_val = abs(value - old_value)
+            n_met = sum([
+                step_max < step_max_thresh,
+                step_rms < step_rms_thresh,
+                grad_max < grad_max_thresh,
+                grad_rms < grad_rms_thresh,
+            ])
+            if d_val < delta_val_thresh and n_met >= 3:
+                break
+        old_value = value
+
+        # BFGS inverse-Hessian update
+        dx = params - params_old
+        dg = grad - grad_old
+        dx_t_dg = float(dx.dot(dg).item())
+        dg_t_inv_h_dg = float((dg @ inv_h @ dg).item())
+
+        if bfgs_cycle == 2:
+            dg_t_dg = float(dg.dot(dg).item())
+            if dg_t_dg > 1e-12:
+                inv_h.diagonal().mul_(2.0 * dx_t_dg / dg_t_dg)
+
+        # Powell damping (Al-Baali–Grandinetti)
+        sigma2, sigma3 = 0.9, 9.0
+        delta = 1.0
+        if abs(dx_t_dg) < abs((1.0 - sigma2) * dg_t_inv_h_dg):
+            delta = sigma2 * dg_t_inv_h_dg / (dg_t_inv_h_dg - dx_t_dg)
+        elif abs(dx_t_dg) > abs((1.0 + sigma3) * dg_t_inv_h_dg):
+            delta = -sigma3 * dg_t_inv_h_dg / (dg_t_inv_h_dg - dx_t_dg)
+        if abs(delta - 1.0) > 1e-12:
+            dx = delta * dx + (1.0 - delta) * (inv_h @ dg)
+            dx_t_dg = float(dx.dot(dg).item())
+        if abs(dx_t_dg) < 1e-9:
+            dx_t_dg = -1e-9 if dx_t_dg < 0.0 else 1e-9
+
+        if dx_t_dg > 0.0:
+            alpha = (dx_t_dg + float((dg @ inv_h @ dg).item())) / (dx_t_dg * dx_t_dg)
+            beta = 1.0 / dx_t_dg
+            inv_h = inv_h + alpha * torch.outer(dx, dx) - beta * (
+                inv_h @ torch.outer(dg, dx) + torch.outer(dx, dg) @ inv_h
+            )
+        else:
+            inv_h = 0.5 * torch.eye(n_params, dtype=dt, device=dev)
+            gdiis_cycle = 0  # flush GDIIS
+
+        # Save old state
+        params_old = params.clone()
+        grad_old = grad.clone()
+
+        # GDIIS extrapolation (may modify params and grad)
+        params, grad, gdiis_cycle = _gdiis_update(
+            inv_h, params, grad, x_store, g_store, gdiis_cycle, gdiis_max_store,
+        )
+
+        step = -(inv_h @ grad)
+
+        # Trust-radius clamping
+        if trust_radius > 0:
+            projected = params + step - params_old
+            max_val = projected.abs().max().item()
+            if max_val > trust_radius:
+                step = projected * (trust_radius / max_val)
+                params = params_old.clone()
+                _reset_inv_h(dg, dx_t_dg)
+                gdiis_cycle = 0  # flush GDIIS
+
+        params = params + step
+        positions[off: off + n_at] = params.reshape(n_at, 3)
+
+        # Oscillation correction
+        value_memory.append(value)
+        if _is_oscillating(value_memory):
+            params = params - step / 2.0
+            positions[off: off + n_at] = params.reshape(n_at, 3)
+            _reset_inv_h(dg, dx_t_dg)
+            value_memory.clear()
+            gdiis_cycle = 0  # flush GDIIS
 
 
 # ---------------------------------------------------------------------------
@@ -532,12 +806,25 @@ def batch_nt2_optimize(
     positions = state.positions.detach().clone()
     max_iter = max(s.settings.max_iter for s in trackers)
 
-    # ---- main loop ----
+    # ---- main loop (matches SCINE NtOptimizer2::optimize ordering) ----
     for cycle in range(1, max_iter + 1):
         if all(t.finished for t in trackers):
             break
 
-        # 1) Build batched state and call model ONCE
+        # 1) BFGS micro cycles FIRST (cycle > 1), before the macro evaluation.
+        #    This matches SCINE which micro-relaxes non-reactive atoms before
+        #    computing the macro energy/gradient.
+        if cycle > 1:
+            for s, tr in enumerate(trackers):
+                if tr.finished:
+                    continue
+                if tr.settings.use_micro_cycles and tr.n_atoms > 2:
+                    _bfgs_micro_cycles(
+                        model, positions, state.masses,
+                        state.cell[s: s + 1], state.pbc, tr, cycle,
+                    )
+
+        # 2) Build batched state and call model ONCE
         current_state = SimState(
             positions=positions.clone(),
             masses=state.masses.clone(),
@@ -550,7 +837,7 @@ def batch_nt2_optimize(
         all_forces = output["forces"].detach()   # [n_total_atoms, 3]
         all_energies = output["energy"].detach()  # [n_systems]
 
-        # 2) Per-system gradient manipulation and convergence (cheap)
+        # 3) Per-system gradient manipulation and convergence (cheap)
         for s, tr in enumerate(trackers):
             if tr.finished:
                 continue
@@ -566,7 +853,13 @@ def batch_nt2_optimize(
             gradients_s = -forces_s
 
             in_extra = tr.extra_macrocycles_remaining >= 0
-            bond_mat = detect_bonds(tr.atomic_numbers, pos_s)
+            bond_kwargs: dict = {}
+            bd_radii = tr.settings.bond_det_cov_radii or tr.settings.cov_radii
+            if bd_radii is not None:
+                bond_kwargs["cov_radii"] = bd_radii
+            if tr.settings.bond_tolerance is not None:
+                bond_kwargs["tolerance"] = tr.settings.bond_tolerance
+            bond_mat = detect_bonds(tr.atomic_numbers, pos_s, **bond_kwargs)
 
             grad_mod, tr.first_coord_reached = _update_gradients(
                 pos_s, gradients_s, tr.atomic_numbers, bond_mat,
@@ -590,6 +883,7 @@ def batch_nt2_optimize(
             else:
                 tr.extra_macrocycles_remaining = -1
 
+            # Macro SD step: positions -= factor * modified_gradients
             new_pos = pos_s - tr.settings.sd_factor * grad_mod
             if tr.settings.fixed_atoms:
                 orig = tr.trajectory[0]

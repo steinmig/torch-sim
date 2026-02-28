@@ -28,6 +28,7 @@ def detect_bonds(
     atomic_numbers: torch.Tensor,
     positions: torch.Tensor,
     tolerance: float = _TOLERANCE_ANGSTROM,
+    cov_radii: dict[int, float] | None = None,
 ) -> torch.Tensor:
     """Detect bonds based on interatomic distances and covalent radii.
 
@@ -36,16 +37,19 @@ def detect_bonds(
 
     Args:
         atomic_numbers: Integer tensor of shape [n_atoms].
-        positions: Float tensor of shape [n_atoms, 3] in Angstrom.
-        tolerance: Extra distance tolerance in Angstrom (default 0.4).
+        positions: Float tensor of shape [n_atoms, 3].
+        tolerance: Extra distance tolerance (default 0.4, in same units
+            as positions/radii).
+        cov_radii: Optional mapping from atomic number to covalent radius.
+            Must be in the same units as *positions* and *tolerance*.
+            Defaults to ASE covalent radii (Angstrom).
 
     Returns:
         Bond order matrix of shape [n_atoms, n_atoms] with 1.0 where a
         bond is detected and 0.0 otherwise. The matrix is symmetric with
         zeros on the diagonal.
     """
-    radii_table = _get_covalent_radii()
-    n = atomic_numbers.shape[0]
+    radii_table = cov_radii if cov_radii is not None else _get_covalent_radii()
     device = positions.device
     dtype = positions.dtype
 
