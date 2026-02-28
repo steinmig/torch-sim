@@ -500,182 +500,216 @@ def _gdiis_update(
     return params, grad, gdiis_cycle
 
 
-def _bfgs_micro_cycles(
+def _batched_bfgs_micro_cycles(
     model: "ModelInterface",
     positions: torch.Tensor,
-    masses: torch.Tensor,
-    cell: torch.Tensor,
-    pbc: torch.Tensor,
-    tr: _SystemTracker,
-    cycle: int,
+    state: SimState,
+    trackers: list[_SystemTracker],
+    system_idx: torch.Tensor,
 ) -> None:
-    """Run BFGS+GDIIS micro-cycle relaxation of non-reactive atoms in-place.
+    """Run BFGS+GDIIS micro-cycle relaxation with batched model calls.
 
-    Faithfully reimplements the SCINE BFGS optimizer loop used inside
-    ``NtOptimizer2`` for micro-iterations, including GDIIS extrapolation,
-    trust-radius clamping, inverse-Hessian damping (Powell / Al-Baali–
-    Grandinetti), and oscillation correction.
+    All active systems are evaluated together in a single batched model call
+    per micro-iteration, then each system's BFGS state is updated
+    independently.  This avoids the O(N*M) sequential model calls of the
+    per-system approach while preserving identical per-system BFGS logic
+    (trust-radius clamping, Powell damping, GDIIS, oscillation correction).
     """
-    off = tr.atom_offset
-    n_at = tr.n_atoms
-    n_params = n_at * 3
+    active: list[tuple[int, _SystemTracker]] = [
+        (s, tr) for s, tr in enumerate(trackers)
+        if not tr.finished and tr.settings.use_micro_cycles and tr.n_atoms > 2
+    ]
+    if not active:
+        return
+
+    max_micro = max(tr.settings.number_of_micro_cycles for _, tr in active)
+    dev, dt = positions.device, positions.dtype
     trust_radius = 0.2
-    max_micro = tr.settings.number_of_micro_cycles
     gdiis_max_store = 5
 
-    dev, dt = positions.device, positions.dtype
-    inv_h = 0.5 * torch.eye(n_params, dtype=dt, device=dev)
+    # ---- per-system BFGS state ----
+    bs: dict[int, dict] = {}
+    for s, tr in active:
+        n_p = tr.n_atoms * 3
+        bs[s] = {
+            "inv_h": 0.5 * torch.eye(n_p, dtype=dt, device=dev),
+            "x_store": torch.zeros(n_p, gdiis_max_store, dtype=dt, device=dev),
+            "g_store": torch.zeros(n_p, gdiis_max_store, dtype=dt, device=dev),
+            "gdiis_cycle": 0,
+            "value_memory": deque(maxlen=10),
+            "bfgs_cycle": 0,
+            "params": None,
+            "params_old": None,
+            "grad_old": None,
+            "old_value": 0.0,
+        }
 
-    # GDIIS storage
-    x_store = torch.zeros(n_params, gdiis_max_store, dtype=dt, device=dev)
-    g_store = torch.zeros(n_params, gdiis_max_store, dtype=dt, device=dev)
-    gdiis_cycle = 0
+    # ---- batched evaluation helper ----
+    def _eval_all() -> dict[int, tuple[float, torch.Tensor]]:
+        pos_l, mass_l, z_l, cell_l, sidx_l = [], [], [], [], []
+        for idx, (s, tr) in enumerate(active):
+            off, n_at = tr.atom_offset, tr.n_atoms
+            pos_l.append(positions[off: off + n_at].clone())
+            mass_l.append(state.masses[off: off + n_at].clone())
+            z_l.append(tr.atomic_numbers.clone())
+            cell_l.append(state.cell[s: s + 1].clone())
+            sidx_l.append(torch.full((n_at,), idx, device=dev, dtype=torch.long))
 
-    def _eval() -> tuple[float, torch.Tensor]:
-        """Evaluate energy and projected micro gradients."""
-        micro_state = SimState(
-            positions=positions[off: off + n_at].clone(),
-            masses=masses[off: off + n_at].clone(),
-            cell=cell.clone(),
-            pbc=pbc,
-            atomic_numbers=tr.atomic_numbers.clone(),
+        batch = SimState(
+            positions=torch.cat(pos_l),
+            masses=torch.cat(mass_l),
+            cell=torch.cat(cell_l),
+            pbc=state.pbc,
+            atomic_numbers=torch.cat(z_l),
+            system_idx=torch.cat(sidx_l),
         )
-        out = model(micro_state)
-        val = float(out["energy"].item())
-        grad = -out["forces"].detach()  # [n_at, 3]
-        grad = _eliminate_reactive_gradients(
-            positions[off: off + n_at], grad,
-            tr.reactive_atoms, tr.constraints_map,
-        )
-        if tr.settings.fixed_atoms:
-            for a in tr.settings.fixed_atoms:
-                grad[a] = 0.0
-        return val, grad
+        out = model(batch)
 
-    def _reset_inv_h(dg: torch.Tensor, dx_t_dg: float) -> None:
-        nonlocal inv_h
+        results: dict[int, tuple[float, torch.Tensor]] = {}
+        a_off = 0
+        for idx, (s, tr) in enumerate(active):
+            n_at = tr.n_atoms
+            val = float(out["energy"][idx].item())
+            grad = -out["forces"][a_off: a_off + n_at].detach()
+            grad = _eliminate_reactive_gradients(
+                positions[tr.atom_offset: tr.atom_offset + n_at], grad,
+                tr.reactive_atoms, tr.constraints_map,
+            )
+            if tr.settings.fixed_atoms:
+                for a in tr.settings.fixed_atoms:
+                    grad[a] = 0.0
+            results[s] = (val, grad)
+            a_off += n_at
+        return results
+
+    def _reset_inv_h(st: dict, n_p: int, dg: torch.Tensor, dx_t_dg: float):
         dg_t_dg = float(dg.dot(dg).item())
         if dg_t_dg > 1e-9:
-            inv_h = torch.eye(n_params, dtype=dt, device=dev) * (dx_t_dg / dg_t_dg)
+            st["inv_h"] = torch.eye(n_p, dtype=dt, device=dev) * (dx_t_dg / dg_t_dg)
         else:
-            inv_h = 0.5 * torch.eye(n_params, dtype=dt, device=dev)
+            st["inv_h"] = 0.5 * torch.eye(n_p, dtype=dt, device=dev)
 
-    value, grad_mat = _eval()
-    grad = grad_mat.reshape(-1)
-    params = positions[off: off + n_at].clone().reshape(-1)
-    params_old = params.clone()
-    grad_old = grad.clone()
-    old_value = value
-
-    # Convergence thresholds (GradientBasedCheck defaults)
-    step_max_thresh = 1e-4
-    step_rms_thresh = 5e-4
-    grad_max_thresh = 5e-5
-    grad_rms_thresh = 1e-5
-    delta_val_thresh = 1e-7
-
-    # Initial step (SD-like with invH = 0.5*I)
-    step = -(inv_h @ grad)
-    if trust_radius > 0:
-        projected = params + step - params_old
-        max_val = projected.abs().max().item()
-        if max_val > trust_radius:
-            step = projected * (trust_radius / max_val)
-    params = params + step
-    positions[off: off + n_at] = params.reshape(n_at, 3)
-
-    value_memory: deque[float] = deque(maxlen=10)
-    bfgs_cycle = 1  # matches SCINE's _cycle after initial step
-
-    for _mc in range(max_micro):
-        bfgs_cycle += 1
-        value, grad_mat = _eval()
+    # ---- initial evaluation (batched) ----
+    results = _eval_all()
+    for s, tr in active:
+        st = bs[s]
+        off, n_at = tr.atom_offset, tr.n_atoms
+        val, grad_mat = results[s]
         grad = grad_mat.reshape(-1)
+        params = positions[off: off + n_at].clone().reshape(-1)
 
-        # Convergence check (SCINE checks BEFORE BFGS update; minIter=1)
-        if bfgs_cycle > 2:  # minIter=1 → check from cycle 3 onward
-            param_step = params - params_old
-            step_max = float(param_step.abs().max().item())
-            step_rms = float((param_step ** 2).mean().sqrt().item())
-            grad_max = float(grad.abs().max().item())
-            grad_rms = float((grad ** 2).mean().sqrt().item())
-            d_val = abs(value - old_value)
-            n_met = sum([
-                step_max < step_max_thresh,
-                step_rms < step_rms_thresh,
-                grad_max < grad_max_thresh,
-                grad_rms < grad_rms_thresh,
-            ])
-            if d_val < delta_val_thresh and n_met >= 3:
-                break
-        old_value = value
+        st["params"] = params
+        st["params_old"] = params.clone()
+        st["grad_old"] = grad.clone()
+        st["old_value"] = val
 
-        # BFGS inverse-Hessian update
-        dx = params - params_old
-        dg = grad - grad_old
-        dx_t_dg = float(dx.dot(dg).item())
-        dg_t_inv_h_dg = float((dg @ inv_h @ dg).item())
-
-        if bfgs_cycle == 2:
-            dg_t_dg = float(dg.dot(dg).item())
-            if dg_t_dg > 1e-12:
-                inv_h.diagonal().mul_(2.0 * dx_t_dg / dg_t_dg)
-
-        # Powell damping (Al-Baali–Grandinetti)
-        sigma2, sigma3 = 0.9, 9.0
-        delta = 1.0
-        if abs(dx_t_dg) < abs((1.0 - sigma2) * dg_t_inv_h_dg):
-            delta = sigma2 * dg_t_inv_h_dg / (dg_t_inv_h_dg - dx_t_dg)
-        elif abs(dx_t_dg) > abs((1.0 + sigma3) * dg_t_inv_h_dg):
-            delta = -sigma3 * dg_t_inv_h_dg / (dg_t_inv_h_dg - dx_t_dg)
-        if abs(delta - 1.0) > 1e-12:
-            dx = delta * dx + (1.0 - delta) * (inv_h @ dg)
-            dx_t_dg = float(dx.dot(dg).item())
-        if abs(dx_t_dg) < 1e-9:
-            dx_t_dg = -1e-9 if dx_t_dg < 0.0 else 1e-9
-
-        if dx_t_dg > 0.0:
-            alpha = (dx_t_dg + float((dg @ inv_h @ dg).item())) / (dx_t_dg * dx_t_dg)
-            beta = 1.0 / dx_t_dg
-            inv_h = inv_h + alpha * torch.outer(dx, dx) - beta * (
-                inv_h @ torch.outer(dg, dx) + torch.outer(dx, dg) @ inv_h
-            )
-        else:
-            inv_h = 0.5 * torch.eye(n_params, dtype=dt, device=dev)
-            gdiis_cycle = 0  # flush GDIIS
-
-        # Save old state
-        params_old = params.clone()
-        grad_old = grad.clone()
-
-        # GDIIS extrapolation (may modify params and grad)
-        params, grad, gdiis_cycle = _gdiis_update(
-            inv_h, params, grad, x_store, g_store, gdiis_cycle, gdiis_max_store,
-        )
-
-        step = -(inv_h @ grad)
-
-        # Trust-radius clamping
+        step = -(st["inv_h"] @ grad)
         if trust_radius > 0:
-            projected = params + step - params_old
-            max_val = projected.abs().max().item()
-            if max_val > trust_radius:
-                step = projected * (trust_radius / max_val)
-                params = params_old.clone()
-                _reset_inv_h(dg, dx_t_dg)
-                gdiis_cycle = 0  # flush GDIIS
+            mx = step.abs().max().item()
+            if mx > trust_radius:
+                step = step * (trust_radius / mx)
+        st["params"] = params + step
+        positions[off: off + n_at] = st["params"].reshape(n_at, 3)
+        st["bfgs_cycle"] = 1
 
-        params = params + step
-        positions[off: off + n_at] = params.reshape(n_at, 3)
+    # ---- main micro-cycle loop (batched eval, per-system BFGS update) ----
+    for _mc in range(max_micro):
+        results = _eval_all()
 
-        # Oscillation correction
-        value_memory.append(value)
-        if _is_oscillating(value_memory):
-            params = params - step / 2.0
+        for s, tr in active:
+            if _mc >= tr.settings.number_of_micro_cycles:
+                continue
+
+            st = bs[s]
+            off, n_at = tr.atom_offset, tr.n_atoms
+            n_p = n_at * 3
+            st["bfgs_cycle"] += 1
+
+            val, grad_mat = results[s]
+            grad = grad_mat.reshape(-1)
+            params = st["params"]
+            params_old = st["params_old"]
+            grad_old = st["grad_old"]
+            inv_h = st["inv_h"]
+
+            # Convergence check (rarely triggers; kept for correctness)
+            if st["bfgs_cycle"] > 2:
+                p_step = params - params_old
+                n_met = sum([
+                    float(p_step.abs().max().item()) < 1e-4,
+                    float((p_step ** 2).mean().sqrt().item()) < 5e-4,
+                    float(grad.abs().max().item()) < 5e-5,
+                    float((grad ** 2).mean().sqrt().item()) < 1e-5,
+                ])
+                if abs(val - st["old_value"]) < 1e-7 and n_met >= 3:
+                    continue
+            st["old_value"] = val
+
+            # BFGS inverse-Hessian update
+            dx = params - params_old
+            dg = grad - grad_old
+            dx_t_dg = float(dx.dot(dg).item())
+            dg_t_inv_h_dg = float((dg @ inv_h @ dg).item())
+
+            if st["bfgs_cycle"] == 2:
+                dg_t_dg = float(dg.dot(dg).item())
+                if dg_t_dg > 1e-12:
+                    inv_h.diagonal().mul_(2.0 * dx_t_dg / dg_t_dg)
+
+            sigma2, sigma3 = 0.9, 9.0
+            delta = 1.0
+            if abs(dx_t_dg) < abs((1.0 - sigma2) * dg_t_inv_h_dg):
+                delta = sigma2 * dg_t_inv_h_dg / (dg_t_inv_h_dg - dx_t_dg)
+            elif abs(dx_t_dg) > abs((1.0 + sigma3) * dg_t_inv_h_dg):
+                delta = -sigma3 * dg_t_inv_h_dg / (dg_t_inv_h_dg - dx_t_dg)
+            if abs(delta - 1.0) > 1e-12:
+                dx = delta * dx + (1.0 - delta) * (inv_h @ dg)
+                dx_t_dg = float(dx.dot(dg).item())
+            if abs(dx_t_dg) < 1e-9:
+                dx_t_dg = -1e-9 if dx_t_dg < 0.0 else 1e-9
+
+            if dx_t_dg > 0.0:
+                alpha = (dx_t_dg + float((dg @ inv_h @ dg).item())) / (dx_t_dg ** 2)
+                beta = 1.0 / dx_t_dg
+                inv_h = inv_h + alpha * torch.outer(dx, dx) - beta * (
+                    inv_h @ torch.outer(dg, dx) + torch.outer(dx, dg) @ inv_h
+                )
+            else:
+                inv_h = 0.5 * torch.eye(n_p, dtype=dt, device=dev)
+                st["gdiis_cycle"] = 0
+
+            st["inv_h"] = inv_h
+            st["params_old"] = params.clone()
+            st["grad_old"] = grad.clone()
+
+            params, grad, st["gdiis_cycle"] = _gdiis_update(
+                inv_h, params, grad,
+                st["x_store"], st["g_store"], st["gdiis_cycle"], gdiis_max_store,
+            )
+
+            step = -(inv_h @ grad)
+
+            if trust_radius > 0:
+                projected = params + step - st["params_old"]
+                mx = projected.abs().max().item()
+                if mx > trust_radius:
+                    step = projected * (trust_radius / mx)
+                    params = st["params_old"].clone()
+                    _reset_inv_h(st, n_p, dg, dx_t_dg)
+                    st["gdiis_cycle"] = 0
+
+            params = params + step
             positions[off: off + n_at] = params.reshape(n_at, 3)
-            _reset_inv_h(dg, dx_t_dg)
-            value_memory.clear()
-            gdiis_cycle = 0  # flush GDIIS
+            st["params"] = params
+
+            st["value_memory"].append(val)
+            if _is_oscillating(st["value_memory"]):
+                params = params - step / 2.0
+                positions[off: off + n_at] = params.reshape(n_at, 3)
+                st["params"] = params
+                _reset_inv_h(st, n_p, dg, dx_t_dg)
+                st["value_memory"].clear()
+                st["gdiis_cycle"] = 0
 
 
 # ---------------------------------------------------------------------------
@@ -812,17 +846,12 @@ def batch_nt2_optimize(
             break
 
         # 1) BFGS micro cycles FIRST (cycle > 1), before the macro evaluation.
-        #    This matches SCINE which micro-relaxes non-reactive atoms before
-        #    computing the macro energy/gradient.
+        #    All active systems are evaluated together in a single batched
+        #    model call per micro-iteration.
         if cycle > 1:
-            for s, tr in enumerate(trackers):
-                if tr.finished:
-                    continue
-                if tr.settings.use_micro_cycles and tr.n_atoms > 2:
-                    _bfgs_micro_cycles(
-                        model, positions, state.masses,
-                        state.cell[s: s + 1], state.pbc, tr, cycle,
-                    )
+            _batched_bfgs_micro_cycles(
+                model, positions, state, trackers, system_idx,
+            )
 
         # 2) Build batched state and call model ONCE
         current_state = SimState(
