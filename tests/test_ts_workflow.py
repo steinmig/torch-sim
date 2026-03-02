@@ -36,6 +36,7 @@ class DoubleWellModel(ModelInterface):
         super().__init__()
         self._device = device
         self._dtype = dtype
+        self.forward_count = 0
 
     @property
     def device(self) -> torch.device:
@@ -46,6 +47,7 @@ class DoubleWellModel(ModelInterface):
         return self._dtype
 
     def forward(self, state: SimState) -> dict[str, torch.Tensor]:
+        self.forward_count += 1
         pos = state.positions
         x, y, z = pos[:, 0], pos[:, 1], pos[:, 2]
 
@@ -141,7 +143,8 @@ class TestIRC:
         assert fwd_x * bwd_x < 0, "forward/backward should be on opposite sides"
 
     def test_batched_matches_single(self):
-        model = DoubleWellModel()
+        model_s1 = DoubleWellModel()
+        model_s2 = DoubleWellModel()
 
         s1 = _make_dw_state(0.0, 0.0, 0.0, mass=1.0)
         s2 = _make_dw_state(0.0, 0.0, 0.0, mass=4.0)
@@ -149,18 +152,28 @@ class TestIRC:
 
         settings = IRCSettings(sd_factor=0.1, initial_step_size=0.3, max_iter=50)
 
-        fwd1, bwd1, _, _ = batch_irc_optimize(model, s1, [mode], settings)
-        fwd2, bwd2, _, _ = batch_irc_optimize(model, s2, [mode], settings)
+        fwd1, bwd1, _, _ = batch_irc_optimize(model_s1, s1, [mode], settings)
+        fwd2, bwd2, _, _ = batch_irc_optimize(model_s2, s2, [mode], settings)
+        single_calls_total = model_s1.forward_count + model_s2.forward_count
 
+        model_batch = DoubleWellModel()
+        s1 = _make_dw_state(0.0, 0.0, 0.0, mass=1.0)
+        s2 = _make_dw_state(0.0, 0.0, 0.0, mass=4.0)
         batched = concatenate_states([s1, s2])
         fwd_b, bwd_b, _, _ = batch_irc_optimize(
-            model, batched, [mode, mode], settings
+            model_batch, batched, [mode, mode], settings
         )
+        batch_calls = model_batch.forward_count
 
         torch.testing.assert_close(fwd_b.positions[0], fwd1.positions[0], atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(fwd_b.positions[1], fwd2.positions[0], atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(bwd_b.positions[0], bwd1.positions[0], atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(bwd_b.positions[1], bwd2.positions[0], atol=1e-4, rtol=1e-4)
+
+        assert batch_calls < single_calls_total, (
+            f"batch ({batch_calls}) should use fewer forward calls than "
+            f"sum of singles ({single_calls_total})"
+        )
 
     def test_mass_weighting_affects_path(self):
         model = DoubleWellModel()

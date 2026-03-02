@@ -120,8 +120,10 @@ class CosineModel(ModelInterface):
         super().__init__()
         self._compute_stress = False
         self._compute_forces = True
+        self.forward_count = 0
 
     def forward(self, state, **kwargs):
+        self.forward_count += 1
         if not isinstance(state, SimState):
             state = SimState(**state)
 
@@ -199,7 +201,7 @@ class TestBofillSimState:
 
     def test_batch_matches_single(self):
         """Two identical copies batched should each match single-system result."""
-        model = CosineModel()
+        model_single = CosineModel()
         x1, x2 = 0.90 * math.pi, 0.10 * math.pi
         settings = BofillSettings(
             trust_radius=0.1, hessian_update=5, max_iter=100,
@@ -207,15 +209,18 @@ class TestBofillSimState:
 
         state_single = _make_cosine_state(x1, x2)
         ts_single, nc_single = bofill_ts_optimize(
-            model, state_single, settings, hessian_delta=0.001,
+            model_single, state_single, settings, hessian_delta=0.001,
         )
+        single_calls = model_single.forward_count
 
+        model_batch = CosineModel()
         s1 = _make_cosine_state(x1, x2)
         s2 = _make_cosine_state(x1, x2)
         batched = concatenate_states([s1, s2])
         ts_batch, ncs_batch = batch_bofill_ts_optimize(
-            model, batched, [settings, settings], hessian_delta=0.001,
+            model_batch, batched, [settings, settings], hessian_delta=0.001,
         )
+        batch_calls = model_batch.forward_count
 
         assert ts_batch.n_systems == 2
         assert nc_single == ncs_batch[0]
@@ -225,3 +230,9 @@ class TestBofillSimState:
             assert torch.allclose(
                 ts_single.positions, ts_batch.positions[mask], atol=1e-10,
             )
+
+        n_systems = 2
+        assert batch_calls < n_systems * single_calls, (
+            f"batch ({batch_calls}) should use fewer forward calls than "
+            f"{n_systems} x single ({single_calls})"
+        )

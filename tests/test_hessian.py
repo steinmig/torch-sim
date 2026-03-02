@@ -24,8 +24,10 @@ class HarmonicModel(ModelInterface):
         self._compute_forces = True
         self.k = k
         self.x0 = x0
+        self.forward_count = 0
 
     def forward(self, state, **kwargs):
+        self.forward_count += 1
         if not isinstance(state, SimState):
             state = SimState(**state)
         positions = state.positions

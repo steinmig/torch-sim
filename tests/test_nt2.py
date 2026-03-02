@@ -89,8 +89,10 @@ class DiatomicMockModel(ModelInterface):
         self._dtype = dtype
         self._compute_stress = False
         self._compute_forces = True
+        self.forward_count = 0
 
     def forward(self, state, **kwargs):
+        self.forward_count += 1
         if not isinstance(state, SimState):
             state = SimState(**state)
 
@@ -156,6 +158,7 @@ class LJGaussianModel(ModelInterface):
         self._compute_forces = True
         self._cov_radii = cov_radii
         self._use_scine_gradient = use_scine_gradient
+        self.forward_count = 0
 
     def _get_radius(self, z: int) -> float:
         if self._cov_radii is not None:
@@ -163,6 +166,7 @@ class LJGaussianModel(ModelInterface):
         return float(_ase_cov_radii[z])
 
     def forward(self, state, **kwargs):
+        self.forward_count += 1
         if not isinstance(state, SimState):
             state = SimState(**state)
 
@@ -712,27 +716,38 @@ class TestNT2Batched:
 
     def test_batch_matches_single(self):
         """Batched run with 1 system should match single-system run."""
-        model = DiatomicMockModel()
+        model_single = DiatomicMockModel()
         r = 11.0
 
         state_single = _make_diatomic_state(r=r)
         ts_single, traj_single, vals_single = nt2_optimize(
-            model, state_single, [0, 1], [], _ASSOC_SETTINGS,
+            model_single, state_single, [0, 1], [], _ASSOC_SETTINGS,
         )
+        single_calls = model_single.forward_count
 
-        state_batch = _make_diatomic_state(r=r)
+        model_batch = DiatomicMockModel()
+        state_batch = _make_batched_diatomic_state([r, r])
         ts_batch, trajs_batch, vals_batch = batch_nt2_optimize(
-            model, state_batch,
-            association_lists=[[0, 1]],
-            dissociation_lists=[[]],
-            settings_list=[_ASSOC_SETTINGS],
+            model_batch, state_batch,
+            association_lists=[[0, 1], [0, 1]],
+            dissociation_lists=[[], []],
+            settings_list=[_ASSOC_SETTINGS, _ASSOC_SETTINGS],
         )
+        batch_calls = model_batch.forward_count
 
-        assert len(vals_single) == len(vals_batch[0])
-        for v1, v2 in zip(vals_single, vals_batch[0]):
-            assert abs(v1 - v2) < 1e-10, f"Energy mismatch: {v1} vs {v2}"
+        for sys in range(2):
+            assert len(vals_single) == len(vals_batch[sys])
+            for v1, v2 in zip(vals_single, vals_batch[sys]):
+                assert abs(v1 - v2) < 1e-10, f"Energy mismatch: {v1} vs {v2}"
 
-        assert torch.allclose(ts_single.positions, ts_batch.positions, atol=1e-10)
+        mask0 = ts_batch.system_idx == 0
+        assert torch.allclose(ts_single.positions, ts_batch.positions[mask0], atol=1e-10)
+
+        n_systems = 2
+        assert batch_calls < n_systems * single_calls, (
+            f"batch ({batch_calls}) should use fewer forward calls than "
+            f"{n_systems} x single ({single_calls})"
+        )
 
     def test_batch_different_settings(self):
         """Systems with different max_iter should converge independently."""
@@ -784,23 +799,35 @@ class TestNT2BatchedSN2:
             assert len(trajs[s]) > 1
 
     def test_batched_sn2_matches_single(self):
-        """Batched SN2 with 1 copy should match single run."""
-        model = LJGaussianModel()
+        """Batched SN2 with 2 copies should match single run and batch calls."""
+        model_single = LJGaussianModel()
 
         state_single = _make_sn2_state()
         ts_single, _, vals_single = nt2_optimize(
-            model, state_single, [0, 1], [1, 5], _SN2_SETTINGS,
+            model_single, state_single, [0, 1], [1, 5], _SN2_SETTINGS,
         )
+        single_calls = model_single.forward_count
 
-        state_batch = _make_sn2_state()
+        model_batch = LJGaussianModel()
+        state_batch = _make_batched_sn2_state(2)
         ts_batch, _, vals_batch = batch_nt2_optimize(
-            model, state_batch,
-            association_lists=[[0, 1]],
-            dissociation_lists=[[1, 5]],
-            settings_list=[_SN2_SETTINGS],
+            model_batch, state_batch,
+            association_lists=[[0, 1], [0, 1]],
+            dissociation_lists=[[1, 5], [1, 5]],
+            settings_list=[_SN2_SETTINGS, _SN2_SETTINGS],
         )
+        batch_calls = model_batch.forward_count
 
-        assert len(vals_single) == len(vals_batch[0])
-        for v1, v2 in zip(vals_single, vals_batch[0]):
-            assert abs(v1 - v2) < 1e-10
-        assert torch.allclose(ts_single.positions, ts_batch.positions, atol=1e-10)
+        for sys in range(2):
+            assert len(vals_single) == len(vals_batch[sys])
+            for v1, v2 in zip(vals_single, vals_batch[sys]):
+                assert abs(v1 - v2) < 1e-10
+
+        mask0 = ts_batch.system_idx == 0
+        assert torch.allclose(ts_single.positions, ts_batch.positions[mask0], atol=1e-10)
+
+        n_systems = 2
+        assert batch_calls < n_systems * single_calls, (
+            f"batch ({batch_calls}) should use fewer forward calls than "
+            f"{n_systems} x single ({single_calls})"
+        )
