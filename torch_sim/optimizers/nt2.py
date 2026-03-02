@@ -5,6 +5,9 @@ The optimizer pushes atom pairs together (association) or apart (dissociation)
 while relaxing the rest of the structure, recording the energy trajectory
 and extracting a TS guess from the highest-energy point.
 
+All default parameter values are in Angstrom / eV units, converted from
+SCINE's Bohr / Hartree defaults.
+
 Supports batched execution: multiple independent NT2 runs share a single
 batched model call per cycle, while per-system gradient manipulation and
 convergence tracking run in a lightweight Python loop.
@@ -24,12 +27,18 @@ from torch_sim.state import SimState
 if TYPE_CHECKING:
     from torch_sim.models.interface import ModelInterface
 
+# SCINE uses Bohr / Hartree.  torch-sim uses Angstrom / eV.
+_BOHR_TO_ANG = 0.529177
+_HARTREE_TO_EV = 27.2114
+_HA_BOHR_TO_EV_ANG = _HARTREE_TO_EV / _BOHR_TO_ANG  # ~51.422 eV/A per Ha/Bohr
+_BOHR2_PER_HARTREE = _BOHR_TO_ANG ** 2 / _HARTREE_TO_EV  # ~0.01029
+
 
 @dataclass
 class NT2Settings:
-    """Settings for the NT2 optimizer."""
-    total_force_norm: float = 0.1
-    sd_factor: float = 1.0
+    """Settings for the NT2 optimizer (Angstrom / eV units)."""
+    total_force_norm: float = 0.1 * _HA_BOHR_TO_EV_ANG  # ~5.14 eV/A
+    sd_factor: float = 1.0 * _BOHR2_PER_HARTREE  # ~0.0103
     max_iter: int = 500
     attractive_distance_stop: float = 0.9
     attractive_bond_order_stop: float = 0.75
@@ -39,6 +48,8 @@ class NT2Settings:
     filter_passes: int = 10
     extraction_criterion: str = "lastBeforeTarget"
     extra_macrocycles_after_bond_criteria: int = 10
+    dissociation_scale: float = 0.8 * _BOHR_TO_ANG  # ~0.42 A
+    min_association_scale: float = 0.1 * _BOHR_TO_ANG  # ~0.053 A
     fixed_atoms: list[int] = field(default_factory=list)
     cov_radii: dict[int, float] | None = None
     bond_det_cov_radii: dict[int, float] | None = None
@@ -276,7 +287,7 @@ def _update_gradients(
 
         scale = dist - r12cov
         if scale < 0:
-            scale = 0.1
+            scale = settings.min_association_scale
         max_scale = max(max_scale, scale)
         direction = c2c * (scale / max(dist, 1e-12))
         for l in left:
@@ -294,7 +305,7 @@ def _update_gradients(
                 first_coord_reached = cycle
             continue
 
-        scale = 0.8
+        scale = settings.dissociation_scale
         max_scale = max(max_scale, scale)
         direction = c2c * (scale / max(dist, 1e-12))
         for l in left:
