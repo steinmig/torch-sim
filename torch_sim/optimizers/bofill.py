@@ -270,6 +270,72 @@ def bofill_optimize(
 
 
 # ---------------------------------------------------------------------------
+# Batched evaluation helper
+# ---------------------------------------------------------------------------
+
+
+def _eval_systems(
+    model: ModelInterface,
+    ref_state: SimState,
+    sys_indices: list[int],
+    per_sys_positions: list[torch.Tensor],
+    counts: torch.Tensor,
+    offsets: torch.Tensor,
+) -> tuple[dict[int, float], dict[int, torch.Tensor]]:
+    """Evaluate model for specified systems at given positions (batched).
+
+    Constructs a single batched SimState from the specified systems and
+    evaluates the model in one forward pass.
+
+    Args:
+        model: ModelInterface.
+        ref_state: Original batched SimState for masses, cell, atomic_numbers.
+        sys_indices: Which systems to evaluate.
+        per_sys_positions: List of ``[n_atoms_s, 3]`` tensors, one per entry
+            in *sys_indices*.
+        counts: Per-system atom counts from ref_state.
+        offsets: Cumulative atom offsets.
+
+    Returns:
+        ``(energies_dict, gradients_dict)`` mapping system index to value.
+    """
+    if not sys_indices:
+        return {}, {}
+
+    all_pos, all_masses, all_z, all_cells, all_sidx = [], [], [], [], []
+    for i, s in enumerate(sys_indices):
+        n_at = int(counts[s].item())
+        off = int(offsets[s].item())
+        all_pos.append(per_sys_positions[i])
+        all_masses.append(ref_state.masses[off : off + n_at])
+        all_z.append(ref_state.atomic_numbers[off : off + n_at])
+        all_cells.append(ref_state.cell[s : s + 1])
+        all_sidx.append(
+            torch.full((n_at,), i, dtype=torch.long, device=ref_state.positions.device)
+        )
+
+    eval_state = SimState(
+        positions=torch.cat(all_pos),
+        masses=torch.cat(all_masses),
+        cell=torch.cat(all_cells),
+        pbc=ref_state.pbc,
+        atomic_numbers=torch.cat(all_z),
+        system_idx=torch.cat(all_sidx),
+    )
+    out = model(eval_state)
+
+    energies: dict[int, float] = {}
+    gradients: dict[int, torch.Tensor] = {}
+    off = 0
+    for i, s in enumerate(sys_indices):
+        n_at = int(counts[s].item())
+        energies[s] = float(out["energy"][i].item())
+        gradients[s] = -out["forces"][off : off + n_at].reshape(-1)
+        off += n_at
+    return energies, gradients
+
+
+# ---------------------------------------------------------------------------
 # SimState / ModelInterface wrapper
 # ---------------------------------------------------------------------------
 
@@ -345,10 +411,11 @@ def batch_bofill_ts_optimize(
 ) -> tuple[SimState, list[int]]:
     """Run Bofill saddle-point optimization on a batched SimState.
 
-    Each system is optimized independently.  Energy/gradient evaluations
-    are batched across systems within each cycle; Hessian evaluations are
-    performed per-system (finite-difference perturbations cannot be shared
-    across systems with different geometries).
+    Model evaluations for energy/forces are batched across systems for
+    GPU efficiency.  Per-system state (Hessians, eigenvectors, etc.) is
+    maintained independently.  Hessian evaluations (finite-difference
+    perturbations) are performed per-system because they cannot be shared
+    across systems with different geometries.
 
     Args:
         model: ModelInterface returning energy and forces (batched).
@@ -358,41 +425,240 @@ def batch_bofill_ts_optimize(
         hessian_delta: Displacement for finite-difference Hessian.
 
     Returns:
-        Tuple of (optimized SimState, list of per-system cycle counts).
+        Tuple of ``(optimized SimState, list of per-system cycle counts)``.
     """
     n_systems = state.n_systems
     if settings_list is None:
         settings_list = [None] * n_systems
     settings_list = [s or BofillSettings() for s in settings_list]
 
+    device = state.positions.device
+    dtype = state.positions.dtype
     system_idx = state.system_idx
     counts = torch.bincount(system_idx, minlength=n_systems)
-    offsets = torch.zeros(n_systems, device=state.device, dtype=torch.long)
-    offsets[1:] = counts[:-1].cumsum(0)
+    offsets = torch.zeros(n_systems + 1, device=device, dtype=torch.long)
+    offsets[1:] = counts.cumsum(0)
+    n_dof = [int(c.item()) * 3 for c in counts]
 
-    result_positions: list[torch.Tensor] = []
-    result_cycles: list[int] = []
+    def _extract_pos(s: int) -> torch.Tensor:
+        o, c = int(offsets[s].item()), int(counts[s].item())
+        return state.positions[o : o + c].clone()
 
-    for s in range(n_systems):
+    def _eval_batch(
+        indices: list[int], positions: list[torch.Tensor],
+    ) -> tuple[dict[int, float], dict[int, torch.Tensor]]:
+        return _eval_systems(model, state, indices, positions, counts, offsets)
+
+    def _hessian_single(s: int, pos_3d: torch.Tensor) -> torch.Tensor:
         n_at = int(counts[s].item())
         off = int(offsets[s].item())
         single = SimState(
-            positions=state.positions[off: off + n_at].clone(),
-            masses=state.masses[off: off + n_at].clone(),
-            cell=state.cell[s: s + 1].clone(),
+            positions=pos_3d,
+            masses=state.masses[off : off + n_at].clone(),
+            cell=state.cell[s : s + 1].clone(),
             pbc=state.pbc,
-            atomic_numbers=state.atomic_numbers[off: off + n_at].clone(),
+            atomic_numbers=state.atomic_numbers[off : off + n_at].clone(),
         )
-        ts, nc = bofill_ts_optimize(model, single, settings_list[s], hessian_delta)
-        result_positions.append(ts.positions)
-        result_cycles.append(nc)
+        return compute_hessian(model, single, delta=hessian_delta)
 
+    # --- Per-system optimiser state ---
+    params = [_extract_pos(s).reshape(-1) for s in range(n_systems)]
+    hessians: list[torch.Tensor | None] = [None] * n_systems
+    grads: list[torch.Tensor | None] = [None] * n_systems
+    values = [0.0] * n_systems
+    prev_eigenvector: list[torch.Tensor | None] = [None] * n_systems
+    mode_to_follow = [settings_list[s].mode_to_follow for s in range(n_systems)]
+    x_old = [p.clone() for p in params]
+    g_old: list[torch.Tensor | None] = [None] * n_systems
+    check_old_params = [p.clone() for p in params]
+    check_old_value = [0.0] * n_systems
+    value_memory: list[deque] = [
+        deque(maxlen=settings_list[s].max_value_memory) for s in range(n_systems)
+    ]
+    converged = [False] * n_systems
+    cycle_counts = [0] * n_systems
+    per_cycle = [1] * n_systems
+    hessian_was_fresh = [True] * n_systems
+
+    # --- Initial evaluation: energy/forces (batched) + hessian (per-system) ---
+    pos_3d = [p.reshape(-1, 3) for p in params]
+    e_init, g_init = _eval_batch(list(range(n_systems)), pos_3d)
+    for s in range(n_systems):
+        values[s] = e_init[s]
+        grads[s] = g_init[s]
+        check_old_value[s] = values[s]
+        hessians[s] = _hessian_single(s, pos_3d[s])
+        g_old[s] = grads[s].clone()
+
+    # --- Main loop ---
+    while True:
+        active = [
+            s for s in range(n_systems)
+            if not converged[s] and per_cycle[s] <= settings_list[s].max_iter
+        ]
+        if not active:
+            break
+
+        for s in active:
+            per_cycle[s] += 1
+
+        # ---- Step computation (pure linear algebra, no model calls) ----
+        per_steps: dict[int, torch.Tensor] = {}
+        already_calculated: set[int] = set()
+        need_recovery: list[int] = []
+
+        for s in active:
+            try:
+                step, mode_to_follow[s], prev_eigenvector[s] = (
+                    _mode_maximization_with_hessian(
+                        grads[s], hessians[s], mode_to_follow[s], prev_eigenvector[s],
+                    )
+                )
+                per_steps[s] = step
+            except RuntimeError:
+                if hessian_was_fresh[s]:
+                    raise
+                need_recovery.append(s)
+
+        # Recovery for failed systems: batched eval + per-system hessian
+        if need_recovery:
+            rec_pos = [params[s].reshape(-1, 3) for s in need_recovery]
+            e_rec, g_rec = _eval_batch(need_recovery, rec_pos)
+            for s in need_recovery:
+                values[s] = e_rec[s]
+                grads[s] = g_rec[s]
+                hessians[s] = _hessian_single(s, params[s].reshape(-1, 3))
+                hessian_was_fresh[s] = True
+                step, mode_to_follow[s], prev_eigenvector[s] = (
+                    _mode_maximization_with_hessian(
+                        grads[s], hessians[s], mode_to_follow[s], prev_eigenvector[s],
+                    )
+                )
+                per_steps[s] = step
+                already_calculated.add(s)
+
+        # ---- Trust radius and parameter update ----
+        for s in active:
+            x_old[s] = params[s].clone()
+            mx = per_steps[s].abs().max()
+            if mx > settings_list[s].trust_radius:
+                per_steps[s] = per_steps[s] * (settings_list[s].trust_radius / mx)
+            params[s] = params[s] + per_steps[s]
+            g_old[s] = grads[s].clone()
+
+        # ---- Regular evaluation for non-recovery systems (batched) ----
+        need_eval = [s for s in active if s not in already_calculated]
+        hessian_update_scheduled: set[int] = set()
+        for s in need_eval:
+            scheduled = (per_cycle[s] - 1) % settings_list[s].hessian_update == 0
+            hessian_was_fresh[s] = scheduled
+            if scheduled:
+                hessian_update_scheduled.add(s)
+
+        if need_eval:
+            eval_pos = [params[s].reshape(-1, 3) for s in need_eval]
+            e_eval, g_eval = _eval_batch(need_eval, eval_pos)
+            for s in need_eval:
+                values[s] = e_eval[s]
+                grads[s] = g_eval[s]
+
+        for s in hessian_update_scheduled:
+            hessians[s] = _hessian_single(s, params[s].reshape(-1, 3))
+
+        got_fresh_hessian = already_calculated | hessian_update_scheduled
+
+        # ---- Convergence check ----
+        for s in active:
+            cfg = settings_list[s]
+            delta_param = params[s] - check_old_params[s]
+            delta_v = values[s] - check_old_value[s]
+            check_old_params[s] = params[s].clone()
+            check_old_value[s] = values[s]
+
+            n_crit = 0
+            if grads[s].abs().max() < cfg.grad_max_coeff:
+                n_crit += 1
+            if delta_param.abs().max() < cfg.step_max_coeff:
+                n_crit += 1
+            if (grads[s] ** 2).sum().sqrt() / (n_dof[s] ** 0.5) < cfg.grad_rms:
+                n_crit += 1
+            if (delta_param ** 2).sum().sqrt() / (n_dof[s] ** 0.5) < cfg.step_rms:
+                n_crit += 1
+
+            stop = (per_cycle[s] >= cfg.max_iter) or (
+                abs(delta_v) < cfg.delta_value
+                and n_crit >= cfg.convergence_requirement
+            )
+            if stop:
+                converged[s] = True
+                cycle_counts[s] = per_cycle[s]
+
+        # ---- Oscillation check (non-converged systems only) ----
+        osc_systems: list[int] = []
+        for s in active:
+            if converged[s]:
+                continue
+            value_memory[s].append(values[s])
+            if _is_oscillating(value_memory[s]):
+                x_old[s] = params[s].clone()
+                g_old[s] = grads[s].clone()
+                params[s] = params[s] - per_steps[s] / 2.0
+                hessian_was_fresh[s] = True
+                osc_systems.append(s)
+                per_cycle[s] += 1
+
+        if osc_systems:
+            osc_pos = [params[s].reshape(-1, 3) for s in osc_systems]
+            e_osc, g_osc = _eval_batch(osc_systems, osc_pos)
+            for s in osc_systems:
+                values[s] = e_osc[s]
+                grads[s] = g_osc[s]
+                hessians[s] = _hessian_single(s, params[s].reshape(-1, 3))
+                got_fresh_hessian.add(s)
+
+        # ---- Bofill Hessian update (skip if fresh hessian this cycle) ----
+        for s in active:
+            if converged[s] or s in got_fresh_hessian:
+                continue
+            dx = params[s] - x_old[s]
+            dg = grads[s] - g_old[s]
+            dx_dot_dx = float((dx @ dx).item())
+            if abs(dx_dot_dx) > 1e-20:
+                tmp2 = dg - hessians[s] @ dx
+                tmp_dot_dx = float((tmp2 @ dx).item())
+
+                den = float((tmp2 @ tmp2).item()) * float((dx @ dx).item())
+                if abs(den) > 1e-20:
+                    bofill_factor = (tmp_dot_dx ** 2) / den
+                else:
+                    bofill_factor = 1.0
+
+                hessians[s] = hessians[s] + (1 - bofill_factor) * (
+                    (torch.outer(tmp2, dx) + torch.outer(dx, tmp2)) / dx_dot_dx
+                )
+                hessians[s] = hessians[s] - (1 - bofill_factor) * (
+                    (tmp_dot_dx * torch.outer(dx, dx)) / (dx_dot_dx ** 2)
+                )
+                if abs(tmp_dot_dx) > 1e-20:
+                    hessians[s] = hessians[s] + bofill_factor * (
+                        torch.outer(tmp2, tmp2) / tmp_dot_dx
+                    )
+
+    # Mark unconverged systems
+    for s in range(n_systems):
+        if not converged[s]:
+            cycle_counts[s] = settings_list[s].max_iter
+
+    # --- Reassemble result ---
+    result_positions = torch.cat(
+        [params[s].reshape(-1, 3) for s in range(n_systems)], dim=0,
+    )
     ts_state = SimState(
-        positions=torch.cat(result_positions, dim=0),
+        positions=result_positions,
         masses=state.masses.clone(),
         cell=state.cell.clone(),
         pbc=state.pbc,
         atomic_numbers=state.atomic_numbers.clone(),
         system_idx=system_idx.clone(),
     )
-    return ts_state, result_cycles
+    return ts_state, cycle_counts
