@@ -6,13 +6,17 @@ using torch-sim components.  All stages are batch-compatible.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
 
 from torch_sim.hessian import compute_hessian
+from torch_sim.io import state_to_atoms
 from torch_sim.optimizers.bofill import BofillSettings, batch_bofill_ts_optimize
+from torch_sim.optimizers.dimer import DimerSettings, batch_dimer_ts_optimize
 from torch_sim.optimizers.irc import (
     IRCSettings,
     batch_irc_optimize,
@@ -23,6 +27,8 @@ from torch_sim.state import SimState, concatenate_states
 
 if TYPE_CHECKING:
     from torch_sim.models.interface import ModelInterface
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -50,11 +56,14 @@ class TSWorkflowSettings:
     """Aggregated settings for the full TS workflow."""
 
     nt2: NT2Settings = field(default_factory=NT2Settings)
+    tsopt_method: str = "bofill"
     tsopt: BofillSettings = field(default_factory=BofillSettings)
+    tsopt_dimer: DimerSettings = field(default_factory=DimerSettings)
     tsopt_hessian_delta: float = 0.01
     hessian_delta: float = 0.01
     irc: IRCSettings = field(default_factory=IRCSettings)
     ircopt: GeomOptSettings = field(default_factory=GeomOptSettings)
+    output_dir: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +91,56 @@ class TSWorkflowResult:
     irc_bwd_cycles: list[int]
     ircopt_fwd_cycles: list[int]
     ircopt_bwd_cycles: list[int]
+
+
+# ---------------------------------------------------------------------------
+# I/O helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_state(state: SimState, path: Path, label: str) -> None:
+    """Write every system in *state* to an XYZ file at *path*."""
+    from ase.io import write
+
+    atoms_list = state_to_atoms(state)
+    for i, atoms in enumerate(atoms_list):
+        atoms.info["label"] = f"{label}_sys{i}"
+    write(str(path), atoms_list, format="extxyz")
+    logger.info("  Wrote %s (%d systems) -> %s", label, len(atoms_list), path)
+
+
+def _write_nt2_trajectories(
+    state: SimState,
+    trajectories: list[list[torch.Tensor]],
+    energies: list[list[float]],
+    output_dir: Path,
+) -> None:
+    """Write per-system NT2 trajectory XYZ files."""
+    from ase.io import write
+
+    ref_atoms_list = state_to_atoms(state)
+    for s, (traj_positions, traj_energies) in enumerate(
+        zip(trajectories, energies)
+    ):
+        if not traj_positions:
+            continue
+        ref = ref_atoms_list[min(s, len(ref_atoms_list) - 1)]
+        frames = []
+        for step, (pos_flat, e) in enumerate(zip(traj_positions, traj_energies)):
+            from ase import Atoms
+
+            atoms = Atoms(
+                numbers=ref.get_atomic_numbers(),
+                positions=pos_flat.detach().cpu().numpy().reshape(-1, 3),
+                cell=ref.get_cell(),
+                pbc=ref.pbc,
+            )
+            atoms.info["energy"] = e
+            atoms.info["step"] = step
+            frames.append(atoms)
+        path = output_dir / f"nt2_trajectory_sys{s}.xyz"
+        write(str(path), frames, format="extxyz")
+        logger.info("  Wrote NT2 trajectory sys %d (%d frames) -> %s", s, len(frames), path)
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +279,16 @@ def batch_ts_workflow(
     settings = settings or TSWorkflowSettings()
     n_systems = state.n_systems
 
+    out_dir: Path | None = None
+    if settings.output_dir is not None:
+        out_dir = Path(settings.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Workflow output directory: %s", out_dir)
+
     # --- Step 1: NT2 -> TS guess ----------------------------------------
+    logger.info(
+        "[Step 1/5] NT2 scan — searching for TS guesses (%d systems)", n_systems
+    )
     nt2_settings = [settings.nt2] * n_systems
     ts_guess, nt2_trajectories, nt2_energies = batch_nt2_optimize(
         model,
@@ -229,17 +297,41 @@ def batch_ts_workflow(
         dissociation_lists,
         settings_list=nt2_settings,
     )
-
-    # --- Step 2: TSOPT (Bofill) -> optimized TS -------------------------
-    tsopt_settings = [settings.tsopt] * n_systems
-    ts_opt, tsopt_cycles = batch_bofill_ts_optimize(
-        model,
-        ts_guess,
-        settings_list=tsopt_settings,
-        hessian_delta=settings.tsopt_hessian_delta,
+    logger.info(
+        "[Step 1/5] NT2 complete — TS guesses obtained for %d systems", n_systems
     )
+    if out_dir is not None:
+        _write_state(ts_guess, out_dir / "ts_guess.xyz", "ts_guess")
+        _write_nt2_trajectories(
+            state, nt2_trajectories, nt2_energies, out_dir
+        )
+
+    # --- Step 2: TSOPT -> optimized TS -----------------------------------
+    if settings.tsopt_method == "dimer":
+        logger.info("[Step 2/5] TSOPT (Dimer) — optimizing TS guesses")
+        dimer_settings = [settings.tsopt_dimer] * n_systems
+        ts_opt, tsopt_cycles = batch_dimer_ts_optimize(
+            model,
+            ts_guess,
+            settings_list=dimer_settings,
+        )
+    else:
+        logger.info("[Step 2/5] TSOPT (Bofill) — optimizing TS guesses")
+        tsopt_settings = [settings.tsopt] * n_systems
+        ts_opt, tsopt_cycles = batch_bofill_ts_optimize(
+            model,
+            ts_guess,
+            settings_list=tsopt_settings,
+            hessian_delta=settings.tsopt_hessian_delta,
+        )
+    logger.info(
+        "[Step 2/5] TSOPT complete — cycles per system: %s", tsopt_cycles
+    )
+    if out_dir is not None:
+        _write_state(ts_opt, out_dir / "ts_opt.xyz", "ts_opt")
 
     # --- Step 3: Hessian at optimized TS --------------------------------
+    logger.info("[Step 3/5] Hessian — computing at optimized TS geometries")
     hessians: list[torch.Tensor] = []
     modes: list[torch.Tensor] = []
     eigenvalues_list: list[torch.Tensor] = []
@@ -251,16 +343,36 @@ def batch_ts_workflow(
         hessians.append(H)
         eigenvalues_list.append(evals)
         modes.append(evecs[:, 0])
+        logger.info(
+            "  System %d: lowest eigenvalue = %.6f", s, evals[0].item()
+        )
+
+    n_imaginary = sum(1 for ev in eigenvalues_list if ev[0] < 0)
+    logger.info(
+        "[Step 3/5] Hessian complete — %d/%d systems have imaginary frequency",
+        n_imaginary,
+        n_systems,
+    )
 
     # --- Step 4: IRC -> forward/backward endpoints ----------------------
+    logger.info("[Step 4/5] IRC — following reaction path from TS")
     irc_fwd, irc_bwd, irc_fwd_cycles, irc_bwd_cycles = batch_irc_optimize(
         model,
         ts_opt,
         modes,
         settings=settings.irc,
     )
+    logger.info(
+        "[Step 4/5] IRC complete — forward cycles: %s, backward cycles: %s",
+        irc_fwd_cycles,
+        irc_bwd_cycles,
+    )
+    if out_dir is not None:
+        _write_state(irc_fwd, out_dir / "irc_forward.xyz", "irc_forward")
+        _write_state(irc_bwd, out_dir / "irc_backward.xyz", "irc_backward")
 
     # --- Step 5: IRCOPT -> optimized endpoints --------------------------
+    logger.info("[Step 5/5] IRCOPT (BFGS) — optimizing IRC endpoints")
     irc_combined = concatenate_states([irc_fwd, irc_bwd])
     ircopt_combined, ircopt_cycles = batch_geometry_optimize(
         model,
@@ -288,6 +400,20 @@ def batch_ts_workflow(
 
     ircopt_fwd_cycles = ircopt_cycles[:n_systems]
     ircopt_bwd_cycles = ircopt_cycles[n_systems:]
+    logger.info(
+        "[Step 5/5] IRCOPT complete — forward cycles: %s, backward cycles: %s",
+        ircopt_fwd_cycles,
+        ircopt_bwd_cycles,
+    )
+    if out_dir is not None:
+        _write_state(
+            irc_fwd_opt, out_dir / "irc_forward_opt.xyz", "irc_forward_opt"
+        )
+        _write_state(
+            irc_bwd_opt, out_dir / "irc_backward_opt.xyz", "irc_backward_opt"
+        )
+
+    logger.info("TS workflow finished for %d systems", n_systems)
 
     return TSWorkflowResult(
         ts_guess=ts_guess,
