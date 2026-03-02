@@ -22,19 +22,27 @@ from torch_sim.state import SimState
 if TYPE_CHECKING:
     from torch_sim.models.interface import ModelInterface
 
+# SCINE uses Bohr / Hartree.  torch-sim uses Angstrom / eV.
+_BOHR_TO_ANG = 0.529177
+_HARTREE_TO_EV = 27.2114
+_HA_BOHR_TO_EV_ANG = _HARTREE_TO_EV / _BOHR_TO_ANG  # ~51.422 eV/A per Ha/Bohr
+
 
 @dataclass
 class BofillSettings:
-    """Settings for the Bofill optimizer."""
-    trust_radius: float = 0.1
+    """Settings for the Bofill optimizer (Angstrom / eV units).
+
+    All defaults converted from SCINE's atomic units (Bohr / Hartree).
+    """
+    trust_radius: float = 0.1 * _BOHR_TO_ANG  # ~0.053 A
     hessian_update: int = 5
     mode_to_follow: int = 0
     max_iter: int = 100
-    step_max_coeff: float = 1e-4
-    step_rms: float = 5e-4
-    grad_max_coeff: float = 5e-5
-    grad_rms: float = 1e-5
-    delta_value: float = 1e-7
+    step_max_coeff: float = 1e-4 * _BOHR_TO_ANG  # ~5.29e-5 A
+    step_rms: float = 5e-4 * _BOHR_TO_ANG  # ~2.65e-4 A
+    grad_max_coeff: float = 5e-5 * _HA_BOHR_TO_EV_ANG  # ~2.57e-3 eV/A
+    grad_rms: float = 1e-5 * _HA_BOHR_TO_EV_ANG  # ~5.14e-4 eV/A
+    delta_value: float = 1e-7 * _HARTREE_TO_EV  # ~2.72e-6 eV
     convergence_requirement: int = 3
     max_value_memory: int = 10
 

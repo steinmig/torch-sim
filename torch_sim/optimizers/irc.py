@@ -21,22 +21,29 @@ from torch_sim.state import SimState
 if TYPE_CHECKING:
     from torch_sim.models.interface import ModelInterface
 
+# SCINE uses Bohr / Hartree.  torch-sim uses Angstrom / eV.
+_BOHR_TO_ANG = 0.529177
+_HARTREE_TO_EV = 27.2114
+_HA_BOHR_TO_EV_ANG = _HARTREE_TO_EV / _BOHR_TO_ANG  # ~51.422 eV/A per Ha/Bohr
+_BOHR2_PER_HARTREE = _BOHR_TO_ANG**2 / _HARTREE_TO_EV  # ~0.01029
+
 
 @dataclass
 class IRCSettings:
-    """Settings for the IRC optimizer.
+    """Settings for the IRC optimizer (Angstrom / eV units).
 
-    Mirrors SCINE's IrcOptimizer + SteepestDescent + GradientBasedCheck settings.
+    Mirrors SCINE's IrcOptimizer + SteepestDescent + GradientBasedCheck settings,
+    with all defaults converted from SCINE's atomic units (Bohr / Hartree).
     """
 
-    sd_factor: float = 2.0
-    initial_step_size: float = 0.3
+    sd_factor: float = 2.0 * _BOHR2_PER_HARTREE  # ~0.0206
+    initial_step_size: float = 0.3 * _BOHR_TO_ANG  # ~0.159 A
     max_iter: int = 100
-    step_max_coeff: float = 2.0e-3
-    step_rms: float = 1.0e-3
-    grad_max_coeff: float = 2.0e-4
-    grad_rms: float = 1.0e-4
-    delta_value: float = 1.0e-6
+    step_max_coeff: float = 2.0e-3 * _BOHR_TO_ANG  # ~1.06e-3 A
+    step_rms: float = 1.0e-3 * _BOHR_TO_ANG  # ~5.29e-4 A
+    grad_max_coeff: float = 2.0e-4 * _HA_BOHR_TO_EV_ANG  # ~1.03e-2 eV/A
+    grad_rms: float = 1.0e-4 * _HA_BOHR_TO_EV_ANG  # ~5.14e-3 eV/A
+    delta_value: float = 1.0e-6 * _HARTREE_TO_EV  # ~2.72e-5 eV
     convergence_requirement: int = 3
 
 

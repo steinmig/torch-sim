@@ -30,6 +30,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# SCINE uses Bohr / Hartree.  torch-sim uses Angstrom / eV.
+_BOHR_TO_ANG = 0.529177
+_HARTREE_TO_EV = 27.2114
+_HA_BOHR_TO_EV_ANG = _HARTREE_TO_EV / _BOHR_TO_ANG  # ~51.422 eV/A per Ha/Bohr
+
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -38,16 +43,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GeomOptSettings:
-    """Settings for BFGS geometry optimization (used by IRCOPT)."""
+    """Settings for BFGS geometry optimization (Angstrom / eV units).
+
+    All defaults converted from SCINE's GradientBasedCheck atomic units.
+    """
 
     max_iter: int = 1000
-    bfgs_trust_radius: float = 0.2
+    bfgs_trust_radius: float = 0.2 * _BOHR_TO_ANG  # ~0.106 A
     bfgs_alpha: float = 70.0
-    step_max_coeff: float = 2.0e-3
-    step_rms: float = 1.0e-3
-    grad_max_coeff: float = 2.0e-4
-    grad_rms: float = 1.0e-4
-    delta_value: float = 1.0e-6
+    step_max_coeff: float = 2.0e-3 * _BOHR_TO_ANG  # ~1.06e-3 A
+    step_rms: float = 1.0e-3 * _BOHR_TO_ANG  # ~5.29e-4 A
+    grad_max_coeff: float = 2.0e-4 * _HA_BOHR_TO_EV_ANG  # ~1.03e-2 eV/A
+    grad_rms: float = 1.0e-4 * _HA_BOHR_TO_EV_ANG  # ~5.14e-3 eV/A
+    delta_value: float = 1.0e-6 * _HARTREE_TO_EV  # ~2.72e-5 eV
     convergence_requirement: int = 3
 
 

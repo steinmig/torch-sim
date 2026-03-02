@@ -33,8 +33,9 @@ logger = logging.getLogger(__name__)
 
 # SCINE uses Bohr / Hartree.  torch-sim uses Angstrom / eV.
 _BOHR_TO_ANG = 0.529177
-_HA_BOHR_TO_EV_ANG = 51.422  # 1 Hartree/Bohr in eV/Angstrom
-_HA_BOHR2_TO_EV_ANG2 = 97.17  # 1 Hartree/Bohr^2 in eV/Angstrom^2
+_HARTREE_TO_EV = 27.2114
+_HA_BOHR_TO_EV_ANG = _HARTREE_TO_EV / _BOHR_TO_ANG  # ~51.422 eV/A per Ha/Bohr
+_HA_BOHR2_TO_EV_ANG2 = _HARTREE_TO_EV / (_BOHR_TO_ANG**2)  # ~97.17 eV/A^2 per Ha/Bohr^2
 
 
 @dataclass
@@ -68,11 +69,11 @@ class DimerSettings:
     rotation_force_threshold: float = 1e-3 * _HA_BOHR_TO_EV_ANG  # ~0.051 eV/A
     max_iter: int = 500
     max_value_memory: int = 10
-    step_max_coeff: float = 2.0e-3
-    step_rms: float = 1.0e-3
-    grad_max_coeff: float = 2.0e-4
-    grad_rms: float = 1.0e-4
-    delta_value: float = 1.0e-6
+    step_max_coeff: float = 2.0e-3 * _BOHR_TO_ANG  # ~1.06e-3 A
+    step_rms: float = 1.0e-3 * _BOHR_TO_ANG  # ~5.29e-4 A
+    grad_max_coeff: float = 2.0e-4 * _HA_BOHR_TO_EV_ANG  # ~1.03e-2 eV/A
+    grad_rms: float = 1.0e-4 * _HA_BOHR_TO_EV_ANG  # ~5.14e-3 eV/A
+    delta_value: float = 1.0e-6 * _HARTREE_TO_EV  # ~2.72e-5 eV
     convergence_requirement: int = 3
 
 
