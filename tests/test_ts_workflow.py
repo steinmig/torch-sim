@@ -1,18 +1,25 @@
-"""Tests for IRC optimizer, geometry optimization, and TS workflow."""
+"""Tests for IRC optimizer, geometry optimization, TS workflow, and memory-safe batching."""
 
 import torch
 
 from torch_sim.hessian import compute_hessian
 from torch_sim.models.interface import ModelInterface
+from torch_sim.optimizers.bofill import BofillSettings
 from torch_sim.optimizers.irc import (
     IRCSettings,
     batch_irc_optimize,
     gradient_based_converged,
 )
+from torch_sim.optimizers.nt2 import NT2Settings
 from torch_sim.state import SimState, concatenate_states
 from torch_sim.workflows.ts_workflow import (
     GeomOptSettings,
+    TSWorkflowSettings,
+    _chunk_indices,
+    _extract_range,
     batch_geometry_optimize,
+    batch_ts_workflow,
+    memory_safe_ts_workflow,
 )
 
 DEVICE = torch.device("cpu")
@@ -368,3 +375,255 @@ class TestPipeline:
             opt.positions[mask1],
             msg="identical systems should optimize identically",
         )
+
+
+# ========================================================================
+# Chunking utilities
+# ========================================================================
+
+
+class TestChunkIndices:
+    def test_exact_division(self):
+        assert _chunk_indices(6, 3) == [(0, 3), (3, 6)]
+
+    def test_remainder(self):
+        assert _chunk_indices(7, 3) == [(0, 3), (3, 6), (6, 7)]
+
+    def test_chunk_larger_than_total(self):
+        assert _chunk_indices(3, 10) == [(0, 3)]
+
+    def test_single_element(self):
+        assert _chunk_indices(1, 1) == [(0, 1)]
+
+    def test_chunk_size_one(self):
+        assert _chunk_indices(3, 1) == [(0, 1), (1, 2), (2, 3)]
+
+
+class TestExtractRange:
+    def test_extract_single(self):
+        s1 = _make_dw_state(1.0, 0.0, 0.0)
+        s2 = _make_dw_state(2.0, 0.0, 0.0)
+        s3 = _make_dw_state(3.0, 0.0, 0.0)
+        batched = concatenate_states([s1, s2, s3])
+
+        sub = _extract_range(batched, 1, 2)
+        assert sub.n_systems == 1
+        assert abs(sub.positions[0, 0].item() - 2.0) < 1e-10
+
+    def test_extract_range(self):
+        states = [_make_dw_state(float(i), 0.0, 0.0) for i in range(5)]
+        batched = concatenate_states(states)
+
+        sub = _extract_range(batched, 1, 4)
+        assert sub.n_systems == 3
+        assert abs(sub.positions[0, 0].item() - 1.0) < 1e-10
+        assert abs(sub.positions[1, 0].item() - 2.0) < 1e-10
+        assert abs(sub.positions[2, 0].item() - 3.0) < 1e-10
+
+    def test_extract_all(self):
+        states = [_make_dw_state(float(i), 0.0, 0.0) for i in range(3)]
+        batched = concatenate_states(states)
+
+        sub = _extract_range(batched, 0, 3)
+        assert sub.n_systems == 3
+        torch.testing.assert_close(sub.positions, batched.positions)
+
+
+# ========================================================================
+# Memory-safe TS workflow
+# ========================================================================
+
+
+class TwoAtomDoubleWell(ModelInterface):
+    """2-atom double-well for full workflow testing.
+
+    E = sum_i [(x_i^2 - 1)^2 + y_i^2 + z_i^2]
+    TS for atom at x=0, minima at x=+-1.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._device = DEVICE
+        self._dtype = DTYPE
+        self.forward_count = 0
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        return self._dtype
+
+    def forward(self, state, **kwargs):
+        self.forward_count += 1
+        if not isinstance(state, SimState):
+            state = SimState(**state)
+        pos = state.positions
+        x, y, z = pos[:, 0], pos[:, 1], pos[:, 2]
+
+        e_per_atom = (x**2 - 1) ** 2 + y**2 + z**2
+        energy = torch.zeros(state.n_systems, device=self.device, dtype=self.dtype)
+        energy.scatter_add_(0, state.system_idx, e_per_atom)
+
+        fx = -4 * x * (x**2 - 1)
+        fy = -2 * y
+        fz = -2 * z
+        forces = torch.stack([fx, fy, fz], dim=-1)
+        return {"energy": energy, "forces": forces}
+
+
+def _make_2atom_state(x0: float, x1: float) -> SimState:
+    """Two hydrogen atoms along x-axis."""
+    return SimState(
+        positions=torch.tensor([[x0, 0.0, 0.0], [x1, 0.0, 0.0]], dtype=DTYPE, device=DEVICE),
+        masses=torch.tensor([1.0, 1.0], dtype=DTYPE, device=DEVICE),
+        cell=100.0 * torch.eye(3, dtype=DTYPE, device=DEVICE).unsqueeze(0),
+        pbc=False,
+        atomic_numbers=torch.tensor([1, 1], dtype=torch.int32, device=DEVICE),
+    )
+
+
+class TestMemorySafeWorkflow:
+    """Tests for memory_safe_ts_workflow and its integration."""
+
+    def _workflow_settings(self) -> TSWorkflowSettings:
+        return TSWorkflowSettings(
+            nt2=NT2Settings(max_iter=3, use_micro_cycles=False),
+            tsopt=BofillSettings(
+                trust_radius=0.1,
+                max_iter=5,
+                hessian_update=2,
+            ),
+            hessian_delta=0.01,
+            tsopt_hessian_delta=0.01,
+            irc=IRCSettings(
+                sd_factor=0.05,
+                initial_step_size=0.2,
+                max_iter=10,
+                grad_max_coeff=1e-2,
+                grad_rms=1e-2,
+                step_max_coeff=1e-2,
+                step_rms=1e-2,
+                delta_value=1e-3,
+                convergence_requirement=3,
+            ),
+            ircopt=GeomOptSettings(
+                max_iter=10,
+                bfgs_trust_radius=0.2,
+                grad_max_coeff=1e-2,
+                grad_rms=1e-2,
+                step_max_coeff=1e-2,
+                step_rms=1e-2,
+                delta_value=1e-3,
+                convergence_requirement=3,
+            ),
+        )
+
+    def test_single_system_smoke(self):
+        """One system through the memory-safe workflow should produce a result."""
+        model = TwoAtomDoubleWell()
+        state = _make_2atom_state(0.01, 0.9)
+        settings = self._workflow_settings()
+
+        result = memory_safe_ts_workflow(
+            model, state,
+            association_lists=[[]],
+            dissociation_lists=[[0, 1]],
+            settings=settings,
+            max_systems=1,
+        )
+        assert result.ts_guess.n_systems == 1
+        assert result.ts_opt.n_systems == 1
+        assert len(result.hessians) == 1
+        assert len(result.tsopt_cycles) == 1
+
+    def test_chunked_matches_unchunked(self):
+        """Two identical systems: chunked (max_systems=1) should match unchunked."""
+        settings = self._workflow_settings()
+
+        model_ref = TwoAtomDoubleWell()
+        s1 = _make_2atom_state(0.01, 0.9)
+        ref_result = memory_safe_ts_workflow(
+            model_ref, s1,
+            association_lists=[[]],
+            dissociation_lists=[[0, 1]],
+            settings=settings,
+            max_systems=10,
+        )
+
+        model_chunk = TwoAtomDoubleWell()
+        s1a = _make_2atom_state(0.01, 0.9)
+        s1b = _make_2atom_state(0.01, 0.9)
+        batched = concatenate_states([s1a, s1b])
+        chunk_result = memory_safe_ts_workflow(
+            model_chunk, batched,
+            association_lists=[[], []],
+            dissociation_lists=[[0, 1], [0, 1]],
+            settings=settings,
+            max_systems=1,
+        )
+
+        assert chunk_result.ts_guess.n_systems == 2
+        assert chunk_result.ts_opt.n_systems == 2
+
+        mask0 = chunk_result.ts_opt.system_idx == 0
+        mask1 = chunk_result.ts_opt.system_idx == 1
+        torch.testing.assert_close(
+            chunk_result.ts_opt.positions[mask0],
+            ref_result.ts_opt.positions,
+            atol=1e-6, rtol=1e-6,
+        )
+        torch.testing.assert_close(
+            chunk_result.ts_opt.positions[mask0],
+            chunk_result.ts_opt.positions[mask1],
+            atol=1e-6, rtol=1e-6,
+        )
+
+    def test_hessian_filter_removes_systems(self):
+        """Systems without imaginary frequency should be filtered before IRC."""
+        model = TwoAtomDoubleWell()
+        s_near_ts = _make_2atom_state(0.01, 0.01)
+        s_at_min = _make_2atom_state(1.0, 1.0)
+        batched = concatenate_states([s_near_ts, s_at_min])
+
+        settings = self._workflow_settings()
+        settings.nt2 = NT2Settings(max_iter=1, use_micro_cycles=False)
+
+        result = memory_safe_ts_workflow(
+            model, batched,
+            association_lists=[[], []],
+            dissociation_lists=[[0, 1], [0, 1]],
+            settings=settings,
+            max_systems=10,
+        )
+
+        assert result.ts_guess.n_systems == 2
+        assert result.ts_opt.n_systems == 2
+        assert len(result.hessians) == 2
+
+        n_neg = sum(1 for ev in result.eigenvalues if ev[0] < 0)
+        assert result.irc_forward.n_systems == n_neg
+        assert result.irc_backward.n_systems == n_neg
+
+    def test_four_systems_chunk_two(self):
+        """Four systems processed in chunks of 2."""
+        model = TwoAtomDoubleWell()
+        states = [_make_2atom_state(0.01, 0.9) for _ in range(4)]
+        batched = concatenate_states(states)
+
+        settings = self._workflow_settings()
+
+        result = memory_safe_ts_workflow(
+            model, batched,
+            association_lists=[[]] * 4,
+            dissociation_lists=[[0, 1]] * 4,
+            settings=settings,
+            max_systems=2,
+        )
+
+        assert result.ts_guess.n_systems == 4
+        assert result.ts_opt.n_systems == 4
+        assert len(result.tsopt_cycles) == 4
+        assert len(result.nt2_trajectories) == 4
+        assert len(result.nt2_energies) == 4

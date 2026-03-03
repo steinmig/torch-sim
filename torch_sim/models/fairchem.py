@@ -79,6 +79,7 @@ class FairChemModel(ModelInterface):
         dtype: torch.dtype | None = None,
         compute_stress: bool = False,
         task_name: UMATask | str | None = None,
+        inference_settings: str = "default",
     ) -> None:
         """Initialize the FairChem model.
 
@@ -95,7 +96,6 @@ class FairChemModel(ModelInterface):
             compute_stress (bool): Whether to compute stress tensor
             task_name (UMATask | str | None): Task type for UMA models (optional,
                 only needed for UMA models)
-
         Raises:
             NotImplementedError: If custom neighbor list function is provided
             ValueError: If model is not a known model name or valid file path
@@ -133,19 +133,27 @@ class FairChemModel(ModelInterface):
         if model in pretrained_mlip.available_models:
             if model_cache_dir and model_cache_dir.exists():
                 self.predictor = pretrained_mlip.get_predict_unit(
-                    model, device=device_str, cache_dir=model_cache_dir
+                    model, device=device_str, cache_dir=model_cache_dir,
+                    inference_settings=inference_settings
                 )
             else:
                 self.predictor = pretrained_mlip.get_predict_unit(
-                    model, device=device_str
+                    model, device=device_str,
+                    inference_settings=inference_settings
                 )
         elif os.path.isfile(model):
-            self.predictor = pretrained_mlip.load_predict_unit(model, device=device_str)
+            self.predictor = pretrained_mlip.load_predict_unit(
+                model, device=device_str,
+                inference_settings=inference_settings
+            )
         else:
             raise ValueError(
                 f"Invalid model name or checkpoint path: {model}. "
                 f"Available pretrained models are: {pretrained_mlip.available_models}"
             )
+
+        if not compute_stress:
+            self._disable_stress_regression()
 
         # Determine implemented properties
         # This is a simplified approach - in practice you might want to
@@ -153,6 +161,41 @@ class FairChemModel(ModelInterface):
         self.implemented_properties = ["energy", "forces"]
         if compute_stress:
             self.implemented_properties.append("stress")
+
+    def _disable_stress_regression(self) -> None:
+        """Disable stress computation to avoid superlinear autograd scaling.
+
+        When regress_stress=True (the UMA default), the backbone creates a
+        displacement tensor and modifies positions via bmm, expanding the
+        autograd graph. The backward pass through this expanded graph scales
+        as O(n^1.4) with batch size instead of linearly. Disabling stress
+        when it is not needed switches to the simple forces-only autograd
+        path which scales linearly.
+        """
+        model = self.predictor.model
+        inner = model.module if hasattr(model, "module") else model
+
+        if hasattr(inner, "backbone"):
+            inner.backbone.regress_stress = False
+
+        for head in getattr(inner, "output_heads", {}).values():
+            if hasattr(head, "regress_stress"):
+                head.regress_stress = False
+            if hasattr(head, "head") and hasattr(head.head, "regress_stress"):
+                head.head.regress_stress = False
+
+        if hasattr(inner, "tasks"):
+            stress_names = [
+                n for n, t in inner.tasks.items() if t.property == "stress"
+            ]
+            for n in stress_names:
+                del inner.tasks[n]
+
+        if hasattr(inner, "dataset_to_tasks"):
+            for ds in inner.dataset_to_tasks:
+                inner.dataset_to_tasks[ds] = [
+                    t for t in inner.dataset_to_tasks[ds] if t.property != "stress"
+                ]
 
     @property
     def dtype(self) -> torch.dtype:
